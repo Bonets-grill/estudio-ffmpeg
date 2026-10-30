@@ -26,4 +26,12 @@ Un montaje de varios clips tarda minutos. En el plan gratuito Render duerme el s
 
 ## Comprobación manual
 
-`GET /salud` responde `{"ok":true}` sin contraseña. El resto de rutas (`/medir`, `/montar`, `/job/...`) exigen la cabecera `Authorization: Bearer <TOKEN>`.
+`GET /salud` y `GET /health` responden con `ok: true` y la versión sin contraseña. El resto de rutas (`/medir`, `/montar`, `/job/...`) exigen la cabecera `Authorization: Bearer <TOKEN>`.
+
+## Montajes resistentes a reinicios
+
+La app espera hasta 90 segundos para despertar el servicio y reintenta los errores temporales tres veces (2, 5 y 10 segundos). Cada montaje tiene un identificador estable: repetir una petición no crea otro trabajo. Se comprueban los archivos antes de descontar créditos.
+
+El estado y los datos para reanudar se guardan en almacenamiento privado de la app, además de una copia local. Tras un reinicio, al consultar el estado se recupera el trabajo y se vuelve a montar desde el principio; los enlaces de entrada duran 24 horas y los de subida tienen su propio plazo de caducidad. Si han caducado, el fallo se muestra y hay que iniciar otro montaje. No requiere un disco de pago en Render.
+
+Los trabajos se procesan uno a uno, con cada escena por separado, y las descargas/subidas se transmiten sin cargar el vídeo entero en memoria. No se cambia el plan Starter.
