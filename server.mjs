@@ -270,4 +270,4 @@ http.createServer(async (req, res) => {
     if (requestUrl.pathname === "/job/comprueba") return send(200, { estado: "desconocido" });
     send(404, { error: "No existe" });
   } catch (e) { send(e.saldo ? 402 : e.status || 500, { error: ocultar(e.message), saldo: !!e.saldo }); }
-}).listen(PORT, () => console.log("ffmpeg-worker en", PORT));
+}).listen(PORT, function () { console.log("ffmpeg-worker en", this.address().port); });
