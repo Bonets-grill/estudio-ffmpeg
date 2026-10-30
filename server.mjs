@@ -5,7 +5,11 @@
 //   GET  /job/:id                                                -> {estado, resultado?, error?}
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, rm, mkdir, rename } from "node:fs/promises";
+import { createWriteStream, createReadStream } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { validarMontaje } from "./validation.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -13,6 +17,46 @@ import { randomUUID } from "node:crypto";
 const TOKEN = process.env.TOKEN;
 const PORT = Number(process.env.PORT || 8080);
 const jobs = new Map();
+const JOB_DIR = process.env.JOB_DIR || join(tmpdir(), "estudio-jobs");
+await mkdir(JOB_DIR, { recursive: true });
+let cola = Promise.resolve();
+const VERSION = "montaje-resiliente-v1";
+const ocultar = (mensaje) => String(mensaje).replace(/https?:\/\/[^\s"<>]+/g, "[enlace protegido]").slice(-1500);
+
+async function guardarEstado(id, estado, entrada) {
+  const dato = { ...estado, ...(entrada ? { entrada } : {}) };
+  const file = join(JOB_DIR, `${id}.json`);
+  await writeFile(`${file}.tmp`, JSON.stringify(dato), { mode: 0o600 });
+  await rename(`${file}.tmp`, file);
+  if (entrada?.estadoSubidaUrl) {
+    const r = await fetch(entrada.estadoSubidaUrl, { method: "PUT", headers: { "Content-Type": "application/json", "x-upsert": "true" }, body: JSON.stringify(dato), signal: AbortSignal.timeout(30000) });
+    if (!r.ok) throw new Error(`No se pudo guardar el estado del trabajo (HTTP ${r.status})`);
+  }
+}
+async function cargarEstado(id, estadoUrl) {
+  try { return JSON.parse(await readFile(join(JOB_DIR, `${id}.json`), "utf8")); } catch {}
+  if (!estadoUrl) return null;
+  const u = new URL(estadoUrl);
+  if (u.protocol !== "https:" || !u.pathname.includes("/storage/v1/object/sign/media/")) throw Object.assign(new Error("estadoUrl: enlace de estado no válido"), { status: 400 });
+  const r = await fetch(u, { signal: AbortSignal.timeout(30000) });
+  if (r.status === 404 || r.status === 400) return null;
+  if (!r.ok) throw new Error(`No se pudo recuperar el estado del trabajo (HTTP ${r.status})`);
+  return r.json();
+}
+function encolar(id, entrada) {
+  if (jobs.has(id)) return;
+  jobs.set(id, true);
+  cola = cola.catch(() => {}).then(async () => {
+    try {
+      const resultado = await montar(entrada);
+      await guardarEstado(id, { estado: "listo", resultado }, entrada);
+    } catch (e) {
+      const error = ocultar(e.message);
+      console.error("Montaje fallido", id, error);
+      await guardarEstado(id, { estado: "fallido", error }, entrada).catch(() => {});
+    } finally { jobs.delete(id); }
+  });
+}
 
 function run(cmd, args, timeoutMs = 300000) {
   return new Promise((ok, ko) => {
@@ -21,15 +65,16 @@ function run(cmd, args, timeoutMs = 300000) {
     const t = setTimeout(() => { p.kill("SIGKILL"); ko(new Error(`${cmd} superó el tiempo máximo`)); }, timeoutMs);
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (err += d));
+    p.on("error", (e) => { clearTimeout(t); ko(e); });
     p.on("close", (c) => { clearTimeout(t); c === 0 ? ok({ out, err }) : ko(new Error(err.slice(-1500))); });
   });
 }
 const X264 = ["-x264-params", "threads=1:lookahead-threads=1:rc-lookahead=0:ref=1:bframes=0:mbtree=0:sliced-threads=0"];
 const ff = (args, t) => run("ffmpeg", ["-hide_banner", "-y", "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1", ...args, "-threads", "1"], t);
-async function bajar(url, path) {
+async function bajar(url, path, campo = "Archivo") {
   const r = await fetch(url, { signal: AbortSignal.timeout(120000) });
-  if (!r.ok) throw new Error(`No se pudo descargar ${url.slice(0, 80)}`);
-  await writeFile(path, Buffer.from(await r.arrayBuffer()));
+  if (!r.ok || !r.body) throw new Error(`${campo}: no se puede descargar (HTTP ${r.status})`);
+  await pipeline(Readable.fromWeb(r.body), createWriteStream(path));
 }
 async function volumen(file, filtro = "") {
   const { err } = await ff(["-i", file, "-af", `${filtro ? filtro + "," : ""}volumedetect`, "-f", "null", "-"], 60000);
@@ -122,12 +167,12 @@ async function montar(p) {
     for (const [i, e] of p.escenas.entries()) {
       const out = join(dir, `p${i}.mp4`);
       if (e.clipUrl) {
-        const src = join(dir, `s${i}.mp4`); await bajar(e.clipUrl, src);
+        const src = join(dir, `s${i}.mp4`); await bajar(e.clipUrl, src, `Escena ${i + 1}: clip`);
         let ss = 0, dur = e.duracion;
         if (e.tipo === "habla" && e.inicio != null) { ss = Math.max(0, e.inicio - 0.35); dur = e.fin + 0.6 - ss; }
         const args = ["-ss", String(ss), "-t", String(dur), "-i", src];
         let audio = "-map 0:a?";
-        if (e.audioUrl) { const au = join(dir, `a${i}.wav`); await bajar(e.audioUrl, au); args.push("-i", au); }
+        if (e.audioUrl) { const au = join(dir, `a${i}.wav`); await bajar(e.audioUrl, au, `Escena ${i + 1}: audio`); args.push("-i", au); }
         const af = e.tipo === "habla" && e.audioUrl ? ["-map", "0:v", "-map", "1:a", "-af", `atrim=${ss}:${ss + dur},asetpts=PTS-STARTPTS`]
           : e.tipo === "off" && e.audioUrl ? ["-map", "0:v", "-map", "1:a", "-af", `adelay=${Math.round((e.retardoOff ?? 0.5) * 1000)}:all=1,apad`]
           : ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "0:v", "-map", `${e.audioUrl ? 2 : 1}:a`];
@@ -172,8 +217,7 @@ async function montar(p) {
     const fin = join(dir, "final.mp4");
     await ff(["-i", pre, "-c:v", "copy", "-af", `volume=${(-15 - I).toFixed(2)}dB,alimiter=limit=0.84:level=false`, "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k", fin]);
     const medidas = await medirFinal(fin, subs, total, dir);
-    const bytes = await readFile(fin);
-    const up = await fetch(p.subidaUrl, { method: "PUT", headers: { "Content-Type": "video/mp4", "x-upsert": "true" }, body: bytes });
+    const up = await fetch(p.subidaUrl, { method: "PUT", headers: { "Content-Type": "video/mp4", "x-upsert": "true" }, body: createReadStream(fin), duplex: "half", signal: AbortSignal.timeout(120000) });
     if (!up.ok) throw new Error(`No se pudo subir el vídeo final (${up.status})`);
     return { srt, medidas, frames: medidas.frames, duracion: total };
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -199,19 +243,31 @@ async function medirFinal(file, subs, total, dir) {
 
 http.createServer(async (req, res) => {
   const send = (c, o) => { res.writeHead(c, { "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
-  if (req.url === "/salud") return send(200, { ok: true });
+  const requestUrl = new URL(req.url || "/", "http://localhost");
+  if (["/salud", "/health"].includes(requestUrl.pathname)) return send(200, { ok: true, version: VERSION });
   if (!TOKEN || req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: "No autorizado" });
-  let body = ""; for await (const c of req) body += c;
-  const j = body ? JSON.parse(body) : {};
   try {
+    let body = ""; for await (const c of req) { body += c; if (body.length > 2_000_000) return send(413, { error: "Petición demasiado grande" }); }
+    let j;
+    try { j = body ? JSON.parse(body) : {}; } catch { return send(400, { error: "El cuerpo de la petición no es JSON válido" }); }
     if (req.method === "POST" && req.url === "/medir") return send(200, await medir(j));
     if (req.method === "POST" && req.url === "/montar") {
-      const id = randomUUID(); jobs.set(id, { estado: "generando" });
-      montar(j).then((r) => jobs.set(id, { estado: "listo", resultado: r })).catch((e) => jobs.set(id, { estado: "fallido", error: e.message }));
+      validarMontaje(j);
+      const id = j.job;
+      const previo = await cargarEstado(id);
+      if (!previo) await guardarEstado(id, { estado: "generando" }, j);
+      if (!previo || previo.estado === "generando") encolar(id, previo?.entrada || j);
       return send(200, { job: id });
     }
-    const m = /^\/job\/(.+)$/.exec(req.url ?? "");
-    if (m) return send(200, jobs.get(m[1]) ?? { estado: "desconocido" });
+    const m = /^\/job\/([0-9a-f-]{36})$/i.exec(requestUrl.pathname);
+    if (req.method === "GET" && m) {
+      const dato = await cargarEstado(m[1], requestUrl.searchParams.get("estadoUrl"));
+      if (!dato) return send(200, { estado: "desconocido", error: "No hay un estado guardado para este trabajo. Puedes repetir el montaje." });
+      if (dato.estado === "generando" && dato.entrada) encolar(m[1], dato.entrada);
+      const { entrada, ...publico } = dato;
+      return send(200, publico);
+    }
+    if (requestUrl.pathname === "/job/comprueba") return send(200, { estado: "desconocido" });
     send(404, { error: "No existe" });
-  } catch (e) { send(e.saldo ? 402 : 500, { error: e.message, saldo: !!e.saldo }); }
+  } catch (e) { send(e.saldo ? 402 : e.status || 500, { error: ocultar(e.message), saldo: !!e.saldo }); }
 }).listen(PORT, () => console.log("ffmpeg-worker en", PORT));
