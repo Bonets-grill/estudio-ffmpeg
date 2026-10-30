@@ -24,7 +24,7 @@ function run(cmd, args, timeoutMs = 300000) {
     p.on("close", (c) => { clearTimeout(t); c === 0 ? ok({ out, err }) : ko(new Error(err.slice(-1500))); });
   });
 }
-const ff = (args, t) => run("ffmpeg", ["-hide_banner", "-y", ...args], t);
+const ff = (args, t) => run("ffmpeg", ["-hide_banner", "-y", "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1", ...args, "-threads", "1"], t);
 async function bajar(url, path) {
   const r = await fetch(url, { signal: AbortSignal.timeout(120000) });
   if (!r.ok) throw new Error(`No se pudo descargar ${url.slice(0, 80)}`);
@@ -163,8 +163,8 @@ async function montar(p) {
     const fijo = p.textoFijo ? `,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='${esc(p.textoFijo)}':fontcolor=white:fontsize=44:box=1:boxcolor=black@0.6:boxborderw=16:x=(w-tw)/2:y=420` : "";
     const pre = join(dir, "pre.mp4");
     // Ducking: la música baja ~14 dB cuando la voz supera 0,003
-    const fc = `[0:v]subtitles=${join(dir, "s.ass")},${drama}${fijo}[v];[1:a]aloop=loop=-1:size=2e9,atrim=0:${total},afade=t=in:d=0.25,afade=t=out:st=${Math.max(0, total - 1.2)}:d=1.2,volume=0.35[m];[0:a]asplit[va][vs];[m][vs]sidechaincompress=threshold=0.003:ratio=20:attack=150:release=250:makeup=1:level_sc=1[md];[va][md]amix=inputs=2:duration=first:normalize=0[a]`;
-    await ff(["-i", voz, "-i", mus, "-filter_complex", fc, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "19", "-preset", "medium", "-r", "30", "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k", pre], 900000);
+    const fc = `[0:v]subtitles=${join(dir, "s.ass")},${drama}${fijo}[v];[1:a]atrim=0:${total},afade=t=in:d=0.25,afade=t=out:st=${Math.max(0, total - 1.2)}:d=1.2,volume=0.35[m];[0:a]asplit[va][vs];[m][vs]sidechaincompress=threshold=0.003:ratio=20:attack=150:release=250:makeup=1:level_sc=1[md];[va][md]amix=inputs=2:duration=first:normalize=0[a]`;
+    await ff(["-i", voz, "-stream_loop", "-1", "-i", mus, "-filter_complex", fc, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "19", "-preset", "medium", "-r", "30", "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k", pre], 900000);
     // Sonoridad a −15 LUFS en dos pasos (medida + ganancia exacta + limitador)
     const m1 = await ff(["-i", pre, "-af", "ebur128=peak=true", "-f", "null", "-"]);
     const I = +(/I:\s+(-?[\d.]+) LUFS/g.exec(m1.err.slice(m1.err.lastIndexOf("Summary")))?.[1] ?? -15);
