@@ -1,0 +1,16 @@
+# Blueprint de Render: con este archivo el servicio se configura solo.
+# Sube esta carpeta a un repositorio de GitHub y en Render elige
+# New → Blueprint → tu repositorio. Render leerá este archivo y creará
+# el servicio con Docker, el plan de pago y la contraseña generada.
+services:
+  - type: web
+    name: estudio-ffmpeg
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: ./
+    healthCheckPath: /salud
+    autoDeploy: true
+    envVars:
+      - key: TOKEN
+        generateValue: true
